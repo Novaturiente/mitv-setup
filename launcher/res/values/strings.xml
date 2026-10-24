@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Home</string>
+    <string name="key_service_label">Home remote keys</string>
+    <string name="key_service_description">Makes the remote\'s PatchWall button open Live TV. Reads no other keys and no screen content.</string>
+</resources>

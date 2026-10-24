@@ -1,0 +1,38 @@
+# MiTV-AXFR2 / watchmen / Android 14, firmware V816.0.26.5.26.UFZAATV only.
+# Reversible debloat profile. setup.sh verifies installed user-0 states before changing them.
+# Never uninstall or hide packages. Missing/hidden packages are reported and left alone.
+# HOME handlers are managed separately after the replacement launcher is installed.
+
+# Telemetry and feedback
+com.miui.tv.analytics
+com.xiaomi.statistic
+com.google.android.feedback
+com.android.tv.feedbackconsent
+com.android.federatedcompute.services
+com.android.ondevicepersonalization.services
+com.android.adservices.api
+
+# Xiaomi recommendations, content and auto-installs
+com.mitv.tvhome.atv
+com.mitv.tvhome.michannel
+com.mitv.tvhome.mitvplus
+com.mitv.tvhome.oemtab
+com.xm.webcontent
+android.autoinstalls.config.xioami.dangal
+com.xiaomi.mimusic2
+com.mitv.gallery
+
+# Cleaner, unused assistant, screensaver and printing
+com.xiaomi.mitv.tvmanager
+com.google.android.katniss
+com.android.printspooler
+# Google Ambient is disabled only when Aerial Views is installed (handled by setup.sh).
+
+# User preference: Aurora Store / SmartTube instead of Play Store / stock YouTube
+com.android.vending
+com.google.android.youtube.tv
+com.google.android.youtube.tvmusic
+com.google.android.play.games
+
+# Keep: firmware updates, Chromecast, Miracast, Mi cast, USB media, HDMI/tuner,
+# Bluetooth/pairing, partnercustomizer, Android core packages and factory services.

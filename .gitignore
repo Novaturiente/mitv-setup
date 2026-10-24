@@ -1,0 +1,18 @@
+# Device data stays local.
+/backup/
+/backups/
+/shots/
+/local-apks/
+**/build/
+*.keystore
+*.jks
+*.idsig
+*.log
+.env
+.env.*
+__pycache__/
+*.pyc
+# Only our explicitly published APKs belong in Git.
+*.apk
+!/apks/launcher.apk
+!/apks/soundbar-keepalive.apk
