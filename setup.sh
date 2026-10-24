@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Restore the known TV profile from the two APKs shipped in this repository.
+# Restore the known TV profile from the launcher APK shipped in this repository.
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$PWD
@@ -14,9 +14,7 @@ WIFI=$(tv dumpsys wifi)
 if [[ "$WIFI" == *cname=com.google.android.tungsten.setupwraith* ]]; then
     fail 'A saved Wi-Fi network belongs to setupwraith. Forget and rejoin it in TV Settings, reconnect ADB, then rerun. Disabling setupwraith now would delete that network.'
 fi
-for apk in apks/launcher.apk apks/soundbar-keepalive.apk; do
-    [ -f "$apk" ] || fail "Missing $apk. Download the complete repository."
-done
+[ -f apks/launcher.apk ] || fail 'Missing apks/launcher.apk. Download the complete repository.'
 if command -v sha256sum >/dev/null; then
     (cd apks && sha256sum -c SHA256SUMS) || fail 'APK checksum mismatch.'
 elif command -v shasum >/dev/null; then
@@ -51,7 +49,7 @@ tv cmd package resolve-activity --brief -a android.intent.action.MAIN -c android
     awk '/^[A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+$/ {print; exit}' > "$BACKUP/home.txt"
 [ -s "$BACKUP/home.txt" ] || fail 'Cannot identify existing Home; nothing changed.'
 : > "$BACKUP/package-states.tsv"
-for pkg in "${DEBLOAT[@]}" com.google.android.apps.tv.dreamx com.google.android.tungsten.setupwraith com.google.android.apps.tv.launcherx com.nova.tvhome com.nova.soundbarkeepalive; do
+for pkg in "${DEBLOAT[@]}" com.google.android.apps.tv.dreamx com.google.android.tungsten.setupwraith com.google.android.apps.tv.launcherx com.nova.tvhome; do
     if has_package "$pkg"; then
         state=$(package_state "$pkg") || fail "Cannot snapshot installed package $pkg; nothing changed."
         printf '%s\t%s\n' "$pkg" "$state" >> "$BACKUP/package-states.tsv"
@@ -64,14 +62,6 @@ done
 LAUNCHER_DUMP=$(tv dumpsys package com.nova.tvhome) || fail 'Cannot snapshot launcher permissions; nothing changed.'
 if [[ "$LAUNCHER_DUMP" == *'android.permission.ACCESS_FINE_LOCATION: granted=true'* ]]; then
     touch "$BACKUP/location-was-granted"
-fi
-KEEPALIVE_DUMP=$(tv dumpsys package com.nova.soundbarkeepalive) || fail 'Cannot snapshot soundbar permissions; nothing changed.'
-if [[ "$KEEPALIVE_DUMP" == *'android.permission.POST_NOTIFICATIONS: granted=true'* ]]; then
-    touch "$BACKUP/notifications-were-granted"
-fi
-SERVICE_DUMP=$(tv dumpsys activity services com.nova.soundbarkeepalive) || fail 'Cannot snapshot service state; nothing changed.'
-if [[ "$SERVICE_DUMP" == *isForeground=true* ]]; then
-    touch "$BACKUP/keepalive-was-running"
 fi
 # A per-run launcher for the shared restore implementation; no device data is interpolated into code.
 # shellcheck disable=SC2016 # Expand these variables when restore runs, not when it is generated.
@@ -87,11 +77,8 @@ install_apk() {
     tv rm "$tmp"
 }
 install_apk apks/launcher.apk /data/local/tmp/mitv-launcher.apk
-install_apk apks/soundbar-keepalive.apk /data/local/tmp/mitv-keepalive.apk
 set_package_state com.nova.tvhome 1 || fail 'Cannot enable new Home.'
-set_package_state com.nova.soundbarkeepalive 1 || fail 'Cannot enable soundbar app.'
 tv pm grant com.nova.tvhome android.permission.ACCESS_FINE_LOCATION
-tv pm grant com.nova.soundbarkeepalive android.permission.POST_NOTIFICATIONS
 
 # Never leave a failed launcher takeover with stock Home disabled.
 TAKEOVER_STARTED=0
@@ -154,15 +141,11 @@ for pkg in com.xiaomi.mitv.updateservice com.xiaomi.mitv.mediaexplorer; do
     has_package "$pkg" || printf 'WARNING: %s is missing/hidden; setup cannot restore a firmware-hidden package.\n' "$pkg"
 done
 
-tv am start-foreground-service -n com.nova.soundbarkeepalive/.KeepAliveService
-sleep 3
-SERVICE=$(tv dumpsys activity services com.nova.soundbarkeepalive)
-[[ "$SERVICE" == *isForeground=true* ]] || fail 'Soundbar foreground service did not start.'
 ACCESS=$(tv dumpsys accessibility)
 [[ "$ACCESS" == *'Service[label=Home remote keys'* ]] || fail 'Remote accessibility service is not bound; check TV Accessibility settings.'
 tv pm list packages -d > "$BACKUP/packages-disabled-after.txt"
-printf 'Verified Home, bound remote service, and soundbar foreground service. Debloat warnings: %s\n' "$WARNINGS"
+printf 'Verified Home and bound remote service. Debloat warnings: %s\n' "$WARNINGS"
 printf 'Restore this run: bash restore.sh %q\n' "$BACKUP"
-printf 'No reboot performed. Soundbar autostart is included; keep-alive effectiveness still depends on the JBL detecting its signal.\n'
+printf 'No reboot performed.\n'
 printf 'When finished, turn off network/USB/Wireless debugging and revoke authorisations on the TV.\n'
 [ "$WARNINGS" -eq 0 ] || exit 2

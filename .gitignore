@@ -15,4 +15,3 @@ __pycache__/
 # Only our explicitly published APKs belong in Git.
 *.apk
 !/apks/launcher.apk
-!/apks/soundbar-keepalive.apk

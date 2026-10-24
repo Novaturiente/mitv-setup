@@ -1,6 +1,6 @@
 # MiTV setup
 
-Recovery and setup tools for [Novaturiente/mitv-setup](https://github.com/Novaturiente/mitv-setup): a native Android TV launcher, a soundbar keep-alive service, and reversible debloating.
+Recovery and setup tools for [Novaturiente/mitv-setup](https://github.com/Novaturiente/mitv-setup): a native Android TV launcher and reversible debloating.
 
 **Required profile:** Xiaomi `MiTV-AXFR2`, board `watchmen` (Amlogic), Android 14 / SDK 34, firmware `V816.0.26.5.26.UFZAATV`, 1.5 GB RAM, 1280×720. Setup requires this exact model, board, Android version, and firmware; other firmware versions, including future updates, are refused. This is a setup recipe after a reset, not a firmware image or a backup of your apps.
 
@@ -19,7 +19,7 @@ adb connect '<TV_DEBUG_ADDRESS>'
 adb devices
 ```
 
-Do not expose ADB to the internet. Turn debugging off when finished; the installed apps do not need an ongoing ADB connection.
+Do not expose ADB to the internet. Turn debugging off when finished; the installed launcher does not need an ongoing ADB connection.
 
 ## Third-party apps
 
@@ -53,13 +53,12 @@ ADB_SERIAL='<DEVICE_IDENTIFIER>' bash setup.sh
 
 `install.sh` is a compatibility wrapper for `setup.sh`, not a source build command.
 
-Setup checks the signed first-party APKs at `apks/launcher.apk` and `apks/soundbar-keepalive.apk` against `apks/SHA256SUMS`. It then saves the run's state locally under `backups/TIMESTAMP/` and generates that backup's `restore.sh` recovery script. Keep the backup directory on your computer.
+Setup checks the signed launcher APK at `apks/launcher.apk` against `apks/SHA256SUMS`. It then saves the run's state locally under `backups/TIMESTAMP/` and generates that backup's `restore.sh` recovery script. Keep the backup directory on your computer.
 
 Setup configures:
 
 - The custom launcher (`com.nova.tvhome`) as Home.
 - The launcher's “Home remote keys” accessibility service to map the PatchWall button to Live TV.
-- Soundbar Keep Alive (`com.nova.soundbarkeepalive`), started immediately and automatically after boot on the known Android 14 profile.
 - Reversible package disabling according to `disable-list.txt`.
 - Aerial Views as screensaver **only if installed**.
 
@@ -86,7 +85,6 @@ A factory reset removes installed apps, settings, and logins. These scripts do n
 ## Known trade-offs
 
 - **PatchWall remap:** the accessibility service consumes keycode 192 (`KEY_WWW`) and opens Live TV. On the tested firmware, enabling it prevents held Volume from ramping: use individual presses. Disable only “Home remote keys” in the TV's accessibility settings to regain repeat behavior; rerunning setup enables it again.
-- **Soundbar keep-alive:** a low-level 200 Hz signal kept the tested HDMI ARC soundbar awake for at least 20 minutes paused. Normal and Dolby playback were also tested. This is not a guarantee for another soundbar, volume, audio route, or firmware. Stop it if audible or playback changes. Screen-off pausing is implemented but not verified on hardware. See [service details](soundbar-keepalive/README.md).
 - Do not open the factory service app (`com.mitv.bspfactoryservice`).
 
 ## Build and customize
@@ -95,12 +93,26 @@ Source builds require an Android SDK, JDK 17 or newer, and the SDK tools `aapt2`
 
 ```sh
 bash launcher/build.sh
-bash soundbar-keepalive/build-install.sh
 ```
 
-The launcher output is `launcher/build/tvhome.apk`. The soundbar output is `soundbar-keepalive/build/keepalive.apk`; its build runs the signal self-test and verifies the APK signature. Building alone does not update the bundled `apks/` files or their checksums. When publishing your own APKs, replace the matching bundled files and regenerate `apks/SHA256SUMS` before setup.
+The launcher output is `launcher/build/tvhome.apk`. Building alone does not update `apks/launcher.apk` or its checksum. When publishing your own APK, replace the bundled file and regenerate `apks/SHA256SUMS` before setup.
 
-Edit `launcher/res/values/config.xml` to change `dock_apps` (package names, left to right), `columns`, `hidden_apps`, or the Live TV mapping. Keep `columns` equal to the number of dock apps (4–7). Rebuild and replace the bundled launcher APK and checksum before rerunning setup. Dock icons are white glyphs; the app grid keeps full-color banners.
+Edit `launcher/res/values/config.xml` to change `dock_apps` (package names, left to right), `columns`, `hidden_apps`, or the Live TV mapping. Keep `columns` equal to the number of dock apps (4–7). Rebuild and replace the bundled launcher APK and checksum before rerunning setup. Unselected app icons are white and become colored when focused. Grid icons are smaller than dock icons and always show their app names. Aerial Views is hidden from Home without disabling its screensaver.
+
+### Continue Watching
+
+The source launcher requests Android's `READ_TV_LISTINGS` permission to read shared Watch Next entries. It shows up to five unfinished titles from installed dock apps, excluding SmartTube and Prime Video, immediately below the dock. SmartTube is last in the dock. Titles are sorted by recent engagement and open the supplying app's resume link. Cards load supplied poster artwork (or thumbnails) in the background, with the title and playback position overlaid. The app icon remains visible if artwork is absent or unavailable. Artwork requires the normal `INTERNET` permission; HTTPS images are supported, with bounded downloads, sampled bitmap decoding, and an in-memory cache. Other URI schemes use the app-icon fallback. Private account integrations are not included.
+
+The list refreshes when Home resumes. The row is hidden when permission is denied or no eligible entries are available. Streaming apps decide whether to publish entries and whether their links actually resume playback; this is not access to their complete private viewing history. These source changes do not update the bundled APK automatically.
+
+Run the selection and artwork-limit tests from the repository root:
+
+```sh
+javac --release 17 -cp "$HOME/Android/Sdk/platforms/android-35/android.jar" -d /tmp/tvhome-tests launcher/src/com/nova/tvhome/WatchNext.java launcher/test/com/nova/tvhome/WatchNextTest.java
+java -cp "/tmp/tvhome-tests:$HOME/Android/Sdk/platforms/android-35/android.jar" com.nova.tvhome.WatchNextTest
+javac --release 17 -cp "$HOME/Android/Sdk/platforms/android-35/android.jar" -d /tmp/tvhome-tests launcher/src/com/nova/tvhome/Artwork.java launcher/test/com/nova/tvhome/ArtworkTest.java
+java -ea -cp "/tmp/tvhome-tests:$HOME/Android/Sdk/platforms/android-35/android.jar" com.nova.tvhome.ArtworkTest
+```
 
 For a wallpaper, add `wallpaper.jpg` or `wallpaper.png` under `launcher/res/drawable-nodpi/` (create the directory), at most 1920×1080. Rebuild and update the bundled APK and checksum. Remove the image and rebuild to return to black.
 
@@ -108,6 +120,6 @@ For a wallpaper, add `wallpaper.jpg` or `wallpaper.png` under `launcher/res/draw
 
 Signing keystores are excluded from Git. **Keep them separately and back them up securely.** Losing the original key prevents installing your new build as an update over the existing app. A factory reset removes that installed-app signing constraint, but also erases apps and user data.
 
-`.gitignore` excludes private backups, screenshots, signing keys, and build output. Backups can contain identifying device/network state; do not publish them. Only the two first-party signed APKs belong in `apks/`.
+`.gitignore` excludes private backups, screenshots, signing keys, and build output. Backups can contain identifying device/network state; do not publish them. Only the first-party signed launcher APK belongs in `apks/`.
 
 The bundled Outfit font has its own SIL Open Font License. That font license does not license the repository's code; no repository-wide license is implied here.

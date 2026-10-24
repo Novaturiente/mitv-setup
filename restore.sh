@@ -13,9 +13,6 @@ select_tv
 check_profile
 [ "$(tv getprop ro.serialno)" = "$(< "$BACKUP/device-serial.txt")" ] || fail 'This backup belongs to a different TV.'
 INSTALLED=$(tv pm list packages --user 0)
-# Stop the custom service and remote helper before restoring package states.
-# If it was already running before setup, restart it after restoring settings.
-tv am stopservice -n com.nova.soundbarkeepalive/.KeepAliveService || true
 FAILED=0
 # Restore the two stock HOME handlers before switching away from the custom launcher.
 for home_pkg in com.google.android.apps.tv.launcherx com.google.android.tungsten.setupwraith; do
@@ -38,22 +35,15 @@ HOME_PKG=${HOME_COMPONENT%%/*}
 FOCUSED=$(awk '/mFocusedApp=/{print}' <<< "$FOCUS")
 [[ "$FOCUSED" == *"$HOME_PKG/"* ]] || fail 'Original Home did not open; custom apps left installed. Inspect TV before continuing.'
 while IFS=$'\t' read -r pkg state; do
-    case "$pkg" in com.google.android.apps.tv.launcherx|com.google.android.tungsten.setupwraith) continue;; esac
+    # Older backups may contain the retired helper; never restore its state.
+    case "$pkg" in com.google.android.apps.tv.launcherx|com.google.android.tungsten.setupwraith|com.nova.soundbarkeepalive) continue;; esac
     set_package_state "$pkg" "$state" || FAILED=1
 done < "$BACKUP/package-states.tsv"
-for pkg in com.nova.tvhome com.nova.soundbarkeepalive; do
-    if ! grep -Fqx "package:$pkg" "$BACKUP/packages-installed.txt"; then
-        tv pm uninstall "$pkg"
-    fi
-done
+if ! grep -Fqx package:com.nova.tvhome "$BACKUP/packages-installed.txt"; then
+    tv pm uninstall com.nova.tvhome
+fi
 if grep -Fqx package:com.nova.tvhome "$BACKUP/packages-installed.txt" && [ ! -f "$BACKUP/location-was-granted" ]; then
     tv pm revoke com.nova.tvhome android.permission.ACCESS_FINE_LOCATION || FAILED=1
-fi
-if grep -Fqx package:com.nova.soundbarkeepalive "$BACKUP/packages-installed.txt" && [ ! -f "$BACKUP/notifications-were-granted" ]; then
-    tv pm revoke com.nova.soundbarkeepalive android.permission.POST_NOTIFICATIONS || FAILED=1
-fi
-if [ -f "$BACKUP/keepalive-was-running" ]; then
-    tv am start-foreground-service -n com.nova.soundbarkeepalive/.KeepAliveService
 fi
 [ "$FAILED" = 0 ] || fail 'Some package states or permissions could not be restored; see messages above.'
 printf 'Original package states, relevant settings and Home restored. APK versions and app data were not rolled back.\n'

@@ -4,15 +4,16 @@
     <integer name="columns">5</integer>
     <!-- Dock apps, left to right, by package name. Missing packages are skipped. -->
     <string-array name="dock_apps">
-        <item>org.smarttube.stable</item>
         <item>com.netflix.ninja</item>
         <item>com.amazon.amazonvideo.livingroom</item>
         <item>in.startv.hotstar</item>
         <item>org.jellyfin.androidtv</item>
+        <item>org.smarttube.stable</item>
     </string-array>
     <!-- Never shown in the grid. Factory apps can switch the TV into factory mode if opened. -->
     <string-array name="hidden_apps">
         <item>com.mitv.bspfactoryservice</item>
+        <item>com.neilturner.aerialviews</item>
     </string-array>
     <!-- Package opened by "Live TV" in the Inputs menu. -->
     <string name="live_tv_package">com.mitv.livetv</string>

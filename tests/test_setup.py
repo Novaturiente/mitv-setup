@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STOCK = "com.google.android.apps.tv.launcherx"
 WRAITH = "com.google.android.tungsten.setupwraith"
 HOME = "com.nova.tvhome"
-KEEPALIVE = "com.nova.soundbarkeepalive"
+RETIRED_HELPER = "com.nova.soundbarkeepalive"
 DREAM = "com.google.android.apps.tv.dreamx"
 AERIAL = "com.neilturner.aerialviews"
 REMOTE = HOME + "/com.nova.tvhome.KeyService"
@@ -83,13 +83,14 @@ if a[:2] == ["dumpsys", "package"]:
     # A different user's state must not override the user-0 record.
     lines.insert(0, "User 10: installed=true hidden=false enabled=2")
     lines += [permission + ": granted=true" for permission in p.get("grants", [])]
-    if s.get("large_dumps") and a[2] in ("com.nova.tvhome", "com.nova.soundbarkeepalive"):
+    if s.get("large_dumps") and a[2] == "com.nova.tvhome":
         lines += ["x" * 1024] * 256
     emit("\n".join(lines))
 if a[:2] == ["pm", "install"]:
     if s.get("install_failure"):
         emit("Failure [INSTALL_FAILED_INVALID_APK]")
-    name = "com.nova.tvhome" if "launcher" in a[-1] else "com.nova.soundbarkeepalive"
+    assert a[-1] == "/data/local/tmp/mitv-launcher.apk", a
+    name = "com.nova.tvhome"
     pkgs.setdefault(name, {"installed": True, "enabled": 0})["installed"] = True
     save()
     emit("Success")
@@ -144,23 +145,12 @@ if a == ["dumpsys", "activity", "activities"]:
     lines = ["mFocusedApp=ActivityRecord{abc u0 " + s["focus"] + " t1}"]
     lines += ["Hist #0: ActivityRecord{old u0 " + component + " t0}" for component in s.get("history", [])]
     emit("\n".join(lines))
-if a[:2] in (["am", "start-foreground-service"], ["am", "stopservice"]):
-    s["running"] = a[1] == "start-foreground-service"
-    save()
-    emit("Starting service" if s["running"] else "Stopping service")
-if a[:3] == ["dumpsys", "activity", "services"]:
-    dump = "isForeground=true" if s.get("running") else "No services"
-    if s.get("large_dumps"):
-        dump += "\n" + ("x" * 1024 + "\n") * 256
-    emit(dump)
 if a == ["dumpsys", "accessibility"]:
     components = s["settings"]["secure"].get("enabled_accessibility_services", "").split(":")
     bound = any(c in components for c in ("com.nova.tvhome/.KeyService", "com.nova.tvhome/com.nova.tvhome.KeyService"))
     emit("Service[label=Home remote keys]" if bound and s["settings"]["secure"].get("accessibility_enabled") == "1" else "No bound services")
 if a[:1] == ["rm"]:
     emit()
-if a[:2] == ["dumpsys", "hdmi_control"]:
-    emit("mSystemAudioActivated=true")
 raise AssertionError("Unsupported fake ADB command: " + repr(a))
 '''
 
@@ -175,12 +165,9 @@ class SetupTests(unittest.TestCase):
             shutil.copyfile(ROOT / name, self.repo / name)
         apks = self.repo / "apks"
         apks.mkdir()
-        checksums = []
-        for name in ("launcher.apk", "soundbar-keepalive.apk"):
-            data = ("test fixture " + name).encode()
-            (apks / name).write_bytes(data)
-            checksums.append(hashlib.sha256(data).hexdigest() + "  " + name)
-        (apks / "SHA256SUMS").write_text("\n".join(checksums) + "\n")
+        data = b"test fixture launcher.apk"
+        (apks / "launcher.apk").write_bytes(data)
+        (apks / "SHA256SUMS").write_text(hashlib.sha256(data).hexdigest() + "  launcher.apk\n")
         bin_dir = self.repo / "bin"
         bin_dir.mkdir()
         adb = bin_dir / "adb"
@@ -201,7 +188,7 @@ class SetupTests(unittest.TestCase):
             "settings": {"system": {}, "global": {}, "secure": {
                 "enabled_accessibility_services": EXISTING, "accessibility_enabled": "1",
                 "screensaver_components": "original/.Dream"}},
-            "home": STOCK_COMPONENT, "focus": STOCK_COMPONENT, "running": False,
+            "home": STOCK_COMPONENT, "focus": STOCK_COMPONENT,
         }
         self.save(self.initial)
         self.env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
@@ -266,20 +253,71 @@ class SetupTests(unittest.TestCase):
         self.assertFalse(any(c[:3] == ["settings", "put", "secure"] and c[3].startswith("screensaver_")
                              for c in self.shell_commands()))
 
-    def test_success_sets_home_and_services_preserving_existing_remote(self):
+    def test_success_sets_home_and_remote_preserving_existing_service(self):
         output = self.run_script()
         state = self.state()
         self.assertEqual(state["home"], HOME + "/.MainActivity")
         self.assertEqual(state["focus"], HOME + "/.MainActivity")
-        self.assertTrue(state["running"])
         self.assertEqual(state["settings"]["secure"]["enabled_accessibility_services"], EXISTING + ":" + REMOTE)
         self.assertEqual(state["settings"]["secure"]["accessibility_enabled"], "1")
-        for package in (HOME, KEEPALIVE):
-            self.assertEqual(state["packages"][package]["enabled"], 1)
+        self.assertEqual(state["packages"][HOME]["enabled"], 1)
+        self.assertIn("android.permission.ACCESS_FINE_LOCATION", state["packages"][HOME]["grants"])
         for package in (STOCK, WRAITH, "com.miui.tv.analytics"):
             self.assertEqual(state["packages"][package]["enabled"], 3)
         self.assertIn("Skipped missing/hidden user-0 package: com.xiaomi.statistic", output)
-        self.assertIn("Verified Home, bound remote service, and soundbar foreground service", output)
+        self.assertIn("Verified Home and bound remote service. Debloat warnings: 0", output)
+
+    def test_setup_never_invokes_retired_helper(self):
+        self.initial["packages"][RETIRED_HELPER] = {"installed": True, "enabled": 3}
+        self.save(self.initial)
+        self.run_script()
+        self.assertEqual(self.state()["packages"][RETIRED_HELPER], self.initial["packages"][RETIRED_HELPER])
+        for command in self.commands():
+            self.assertFalse(any(RETIRED_HELPER in arg for arg in command), command)
+        backup, = (self.repo / "backups").iterdir()
+        self.assertNotIn(RETIRED_HELPER, (backup / "package-states.tsv").read_text())
+        for marker in ("notifications-were-granted", "keepalive-was-running"):
+            self.assertFalse((backup / marker).exists(), marker)
+        installs = [c for c in self.shell_commands() if c[:2] == ["pm", "install"]]
+        self.assertEqual(installs, [["pm", "install", "-r", "/data/local/tmp/mitv-launcher.apk"]])
+        grants = [c for c in self.shell_commands() if c[:2] == ["pm", "grant"]]
+        self.assertEqual(grants, [["pm", "grant", HOME, "android.permission.ACCESS_FINE_LOCATION"]])
+
+    def test_restore_ignores_legacy_helper_state_and_markers(self):
+        self.run_script()
+        backup, = (self.repo / "backups").iterdir()
+        with (backup / "package-states.tsv").open("a") as target:
+            target.write(RETIRED_HELPER + "\t0\n")
+        with (backup / "packages-installed.txt").open("a") as target:
+            target.write("package:" + RETIRED_HELPER + "\n")
+        for marker in ("notifications-were-granted", "keepalive-was-running"):
+            (backup / marker).touch()
+        state = self.state()
+        legacy_state = {"installed": True, "enabled": 3,
+                        "grants": ["android.permission.POST_NOTIFICATIONS"]}
+        state["packages"][RETIRED_HELPER] = legacy_state
+        self.save(state)
+        before = len(self.commands())
+        self.run_script("restore.sh", backup)
+        self.assertEqual(self.state()["packages"][RETIRED_HELPER], legacy_state)
+        self.assertEqual(self.state()["home"], STOCK_COMPONENT)
+        self.assertEqual(self.state()["settings"], self.initial["settings"])
+        self.assertFalse(self.state()["packages"][HOME]["installed"])
+        for command in self.commands()[before:]:
+            self.assertFalse(any(RETIRED_HELPER in arg for arg in command), command)
+            self.assertNotIn("start-foreground-service", command)
+            self.assertNotIn("stopservice", command)
+
+    def test_restore_revokes_only_new_launcher_location_grant(self):
+        self.initial["packages"][HOME] = {"installed": True, "enabled": 0, "grants": []}
+        self.save(self.initial)
+        self.run_script()
+        backup, = (self.repo / "backups").iterdir()
+        self.assertFalse((backup / "location-was-granted").exists())
+        self.assertIn("android.permission.ACCESS_FINE_LOCATION", self.state()["packages"][HOME]["grants"])
+        self.run_script("restore.sh", backup)
+        self.assertEqual(self.state()["packages"], self.initial["packages"])
+        self.assertIn(["pm", "revoke", HOME, "android.permission.ACCESS_FINE_LOCATION"], self.shell_commands())
 
     def test_second_setup_does_not_duplicate_remote_service(self):
         self.run_script()
@@ -322,12 +360,11 @@ class SetupTests(unittest.TestCase):
         self.assertIn("Original Home did not open; custom apps left installed", output)
         state = self.state()
         self.assertEqual(state["focus"], "com.example.failed/.Activity")
-        for package in (HOME, KEEPALIVE):
-            self.assertTrue(state["packages"][package]["installed"])
-            self.assertEqual(state["packages"][package]["enabled"], 1)
+        self.assertTrue(state["packages"][HOME]["installed"])
+        self.assertEqual(state["packages"][HOME]["enabled"], 1)
         restore_commands = self.shell_commands()[before:]
         self.assertFalse(any(c[:2] == ["pm", "uninstall"] for c in restore_commands))
-        self.assertFalse(any(c[:1] == ["pm"] and c[-1] in (HOME, KEEPALIVE)
+        self.assertFalse(any(c[:1] == ["pm"] and c[-1] == HOME
                              for c in restore_commands))
 
     def test_initial_installed_package_snapshot_failure_prevents_mutation(self):
@@ -351,33 +388,24 @@ class SetupTests(unittest.TestCase):
         self.run_script()
         self.assertEqual(self.state()["packages"][package]["enabled"], 3)
 
-    def test_large_dumps_preserve_existing_permission_and_service_markers(self):
+    def test_large_dumps_preserve_existing_location_permission(self):
         self.initial["packages"][HOME] = {
             "installed": True, "enabled": 0,
             "grants": ["android.permission.ACCESS_FINE_LOCATION"],
         }
-        self.initial["packages"][KEEPALIVE] = {
-            "installed": True, "enabled": 0,
-            "grants": ["android.permission.POST_NOTIFICATIONS"],
-        }
-        self.initial["running"] = True
         self.initial["large_dumps"] = True
         self.save(self.initial)
         self.run_script()
         backup, = (self.repo / "backups").iterdir()
-        for marker in ("location-was-granted", "notifications-were-granted", "keepalive-was-running"):
-            self.assertTrue((backup / marker).is_file(), marker)
+        self.assertTrue((backup / "location-was-granted").is_file())
         before = len(self.shell_commands())
         self.run_script("restore.sh", backup)
         state = self.state()
-        self.assertTrue(state["running"])
         self.assertEqual(state["packages"], self.initial["packages"])
         self.assertEqual(state["settings"], self.initial["settings"])
         restore_commands = self.shell_commands()[before:]
         self.assertFalse(any(c[:2] in (["pm", "revoke"], ["pm", "uninstall"])
                              for c in restore_commands))
-        self.assertIn(["am", "start-foreground-service", "-n", KEEPALIVE + "/.KeepAliveService"],
-                      restore_commands)
 
     def test_restore_default_states_settings_and_original_home(self):
         self.initial["packages"][AERIAL] = {"installed": True, "enabled": 0}
@@ -391,11 +419,9 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(state["home"], STOCK_COMPONENT)
         self.assertEqual(state["focus"], STOCK_COMPONENT)
         self.assertEqual(state["settings"], self.initial["settings"])
-        self.assertFalse(state["running"])
         for package, original in self.initial["packages"].items():
             self.assertEqual(state["packages"][package], original, package)
-        for package in (HOME, KEEPALIVE):
-            self.assertFalse(state["packages"][package]["installed"])
+        self.assertFalse(state["packages"][HOME]["installed"])
         self.assertIn(["pm", "default-state", "--user", "0", STOCK], self.shell_commands())
         self.assertIn(["settings", "delete", "secure", "screensaver_default_component"], self.shell_commands())
 

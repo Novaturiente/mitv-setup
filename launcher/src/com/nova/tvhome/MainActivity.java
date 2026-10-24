@@ -34,11 +34,15 @@ import android.os.Bundle;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.text.format.DateFormat;
+import android.text.format.DateUtils;
+import android.util.Log;
+import android.util.LruCache;
 import android.util.DisplayMetrics;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.ViewTreeObserver;
 import android.view.animation.DecelerateInterpolator;
 import android.view.animation.OvershootInterpolator;
 import android.widget.FrameLayout;
@@ -53,6 +57,10 @@ import java.util.Calendar;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /** Apple TV style home screen. One activity, framework views only, own D-pad focus model. */
 public class MainActivity extends Activity {
@@ -62,7 +70,7 @@ public class MainActivity extends Activity {
     private static final class App {
         String pkg, label;
         Intent launch;
-        Drawable art, mono;
+        Drawable art, icon, mono;
         boolean banner;
         int glow;
     }
@@ -70,6 +78,13 @@ public class MainActivity extends Activity {
     private final List<App> dockApps = new ArrayList<>(), gridApps = new ArrayList<>();
     private final List<LinearLayout> dockTiles = new ArrayList<>(), gridTiles = new ArrayList<>();
     private final List<TextView> pills = new ArrayList<>();
+    private final List<WatchNext.Program> continuePrograms = new ArrayList<>();
+    private final List<LinearLayout> continueTiles = new ArrayList<>();
+    private final ExecutorService watchNextExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService artworkExecutor = Executors.newFixedThreadPool(2);
+    private final LruCache<String, Bitmap> artworkCache = new LruCache<>(5);
+    private LinearLayout continueSection;
+    private int baseGridTop, watchNextLoadId;
 
     private FrameLayout root;
     private LinearLayout page;
@@ -79,7 +94,8 @@ public class MainActivity extends Activity {
     private Typeface thin, light, regular;
 
     private int W, H, M, G, P, cols, tileW, tileH, labelH, tileTotalH, bandH, headerH, rowH, gridTop, pillH;
-    // row -1 = top bar, 0 = dock, 1.. = grid rows. Kept across app launches: "remember last tile".
+    // row -1 = top bar, 0 = dock, then optional Continue Watching and grid rows.
+    // Kept across app launches: "remember last tile".
     private int row = 0, col = 0, pill = 0, lastDockCol = 0;
     private float pageTarget = 0;
     private int glowColor = FALLBACK_GLOW;
@@ -126,10 +142,15 @@ public class MainActivity extends Activity {
             @Override public void onLost(Network n) { runOnUiThread(() -> wifiPill.setText("Offline")); }
         };
         cm.registerDefaultNetworkCallback(netCallback);
+        if (checkSelfPermission("android.permission.READ_TV_LISTINGS") != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{"android.permission.READ_TV_LISTINGS"}, 21);
+        }
     }
 
     @Override
     protected void onDestroy() {
+        watchNextExecutor.shutdownNow();
+        artworkExecutor.shutdownNow();
         unregisterReceiver(packageReceiver);
         getSystemService(ConnectivityManager.class).unregisterNetworkCallback(netCallback);
         super.onDestroy();
@@ -156,6 +177,7 @@ public class MainActivity extends Activity {
         super.onResume();
         resumed = true;
         if (laidOut) applyFocus(false);
+        refreshWatchNext();
     }
 
     @Override
@@ -226,7 +248,8 @@ public class MainActivity extends Activity {
         page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
         View header = buildHeader(); // sets headerH
-        gridTop = headerH + bandH + 2 * G;
+        baseGridTop = headerH + bandH + 2 * G;
+        gridTop = baseGridTop;
         root.addView(page, new FrameLayout.LayoutParams(W, gridTop + gridRows * rowH + H));
         page.addView(header, new LinearLayout.LayoutParams(W, headerH));
 
@@ -244,6 +267,9 @@ public class MainActivity extends Activity {
         }
 
         page.addView(new View(this), new LinearLayout.LayoutParams(W, 2 * G));
+        continueSection = new LinearLayout(this);
+        continueSection.setOrientation(LinearLayout.VERTICAL);
+        page.addView(continueSection, new LinearLayout.LayoutParams(W, 0));
         for (int r = 0; r < gridRows; r++) {
             LinearLayout line = new LinearLayout(this);
             LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(W - 2 * M, rowH);
@@ -270,6 +296,181 @@ public class MainActivity extends Activity {
                 applyFocus(false);
             }
         });
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == 21 && grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED) refreshWatchNext();
+    }
+
+    private void refreshWatchNext() {
+        if (checkSelfPermission("android.permission.READ_TV_LISTINGS") != PackageManager.PERMISSION_GRANTED) return;
+        Set<String> allowed = new HashSet<>();
+        for (App app : dockApps) {
+            if (!"org.smarttube.stable".equals(app.pkg)) allowed.add(app.pkg);
+        }
+        int loadId = ++watchNextLoadId;
+        watchNextExecutor.execute(() -> {
+            List<WatchNext.Program> result;
+            try {
+                result = WatchNext.load(getContentResolver(), allowed);
+            } catch (RuntimeException e) {
+                Log.w("TvHome", "Watch Next unavailable", e);
+                result = new ArrayList<>();
+            }
+            List<WatchNext.Program> programs = result;
+            runOnUiThread(() -> {
+                if (isDestroyed() || loadId != watchNextLoadId) return;
+                showWatchNext(programs);
+                Log.i("TvHome", "Eligible Continue Watching items: " + programs.size());
+            });
+        });
+    }
+
+    private int firstGridRow() { return continuePrograms.isEmpty() ? 1 : 2; }
+
+    private boolean isContinueRow() { return row == 1 && !continuePrograms.isEmpty(); }
+
+    private void showWatchNext(List<WatchNext.Program> programs) {
+        int oldFirstGrid = firstGridRow();
+        boolean wasGrid = row >= oldFirstGrid;
+        continuePrograms.clear();
+        continuePrograms.addAll(programs);
+        if (wasGrid) row += firstGridRow() - oldFirstGrid;
+        else if (row == 1 && programs.isEmpty()) { row = 0; col = lastDockCol; }
+        continueTiles.clear();
+        continueSection.removeAllViews();
+        int height = 0;
+        if (!programs.isEmpty()) {
+            TextView heading = text(regular, H * 0.031f, Color.WHITE);
+            heading.setText("Continue Watching");
+            LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(W - 2 * M, labelH + G / 2);
+            hp.leftMargin = M;
+            continueSection.addView(heading, hp);
+            LinearLayout line = new LinearLayout(this);
+            LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(W - 2 * M, rowH);
+            rp.leftMargin = M;
+            continueSection.addView(line, rp);
+            for (WatchNext.Program program : programs) {
+                LinearLayout tile = continueTile(program);
+                LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(tileW, tileTotalH);
+                if (!continueTiles.isEmpty()) tp.leftMargin = G;
+                line.addView(tile, tp);
+                continueTiles.add(tile);
+            }
+            height = labelH + G / 2 + rowH;
+        }
+        continueSection.setLayoutParams(new LinearLayout.LayoutParams(W, height));
+        gridTop = baseGridTop + height;
+        page.setLayoutParams(new FrameLayout.LayoutParams(W,
+                gridTop + ((gridApps.size() + cols - 1) / cols) * rowH + H));
+        page.getViewTreeObserver().addOnGlobalLayoutListener(new ViewTreeObserver.OnGlobalLayoutListener() {
+            @Override public void onGlobalLayout() {
+                page.getViewTreeObserver().removeOnGlobalLayoutListener(this);
+                if (!isDestroyed() && laidOut) applyFocus(false);
+            }
+        });
+    }
+
+    private LinearLayout continueTile(WatchNext.Program program) {
+        LinearLayout tile = new LinearLayout(this);
+        tile.setOrientation(LinearLayout.VERTICAL);
+        FrameLayout card = new FrameLayout(this);
+        card.setBackground(rounded(0xFF26262A, tileH * 0.08f));
+        card.setClipToOutline(true);
+        ImageView poster = new ImageView(this);
+        poster.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        int padding = tileH / 5;
+        poster.setPadding(padding, padding, padding, padding);
+        for (App app : dockApps) if (app.pkg.equals(program.packageName)) poster.setImageDrawable(app.icon);
+        card.addView(poster, new FrameLayout.LayoutParams(-1, -1));
+        View shade = new View(this);
+        shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{0x00000000, 0xEE000000}));
+        card.addView(shade, new FrameLayout.LayoutParams(-1, -1));
+        LinearLayout caption = new LinearLayout(this);
+        caption.setOrientation(LinearLayout.VERTICAL);
+        caption.setPadding(G / 2, G / 3, G / 2, G / 3);
+        TextView title = text(regular, H * 0.025f, Color.WHITE);
+        title.setText(program.title);
+        title.setMaxLines(2);
+        title.setEllipsize(TextUtils.TruncateAt.END);
+        caption.addView(title, new LinearLayout.LayoutParams(-1, -2));
+        TextView progress = text(regular, H * 0.019f, 0xBBFFFFFF);
+        progress.setText(program.positionMillis > 0
+                ? "Resume at " + DateUtils.formatElapsedTime(program.positionMillis / 1000) : "Resume");
+        caption.addView(progress);
+        card.addView(caption, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+        card.setContentDescription(program.title);
+        loadArtwork(poster, program);
+        tile.addView(card, new LinearLayout.LayoutParams(tileW, tileH));
+        TextView appName = text(regular, H * 0.023f, 0xE6FFFFFF);
+        for (App app : dockApps) if (app.pkg.equals(program.packageName)) appName.setText(app.label);
+        appName.setGravity(Gravity.CENTER);
+        appName.setSingleLine(true);
+        appName.setEllipsize(TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(tileW, labelH);
+        lp.topMargin = G / 3;
+        tile.addView(appName, lp);
+        return tile;
+    }
+
+    private void loadArtwork(ImageView image, WatchNext.Program program) {
+        String key = (program.posterUri == null ? "" : program.posterUri) + "\n"
+                + (program.thumbnailUri == null ? "" : program.thumbnailUri);
+        if (key.trim().isEmpty()) return;
+        image.setTag(key);
+        Bitmap cached = artworkCache.get(key);
+        if (cached != null) { showArtwork(image, cached); return; }
+        int width = tileW, height = tileH;
+        artworkExecutor.execute(() -> {
+            Bitmap loaded = null;
+            for (String uri : new String[]{program.posterUri, program.thumbnailUri}) {
+                if (Thread.currentThread().isInterrupted()) return;
+                if (uri == null || uri.trim().isEmpty()) continue;
+                try {
+                    loaded = Artwork.load(uri, width, height);
+                } catch (java.io.IOException | RuntimeException e) {
+                    // Keep the app icon; do not log artwork URLs that may contain access tokens.
+                    Log.w("TvHome", "Artwork read failed: " + e.getClass().getSimpleName());
+                }
+                if (loaded != null) break;
+            }
+            Bitmap bitmap = loaded;
+            runOnUiThread(() -> {
+                if (isDestroyed()) return;
+                if (bitmap == null) { Log.w("TvHome", "Continue Watching artwork unavailable"); return; }
+                artworkCache.put(key, bitmap);
+                if (image.isAttachedToWindow() && key.equals(image.getTag())) {
+                    showArtwork(image, bitmap);
+                    Log.i("TvHome", "Continue Watching artwork loaded");
+                }
+            });
+        });
+    }
+
+    private void showArtwork(ImageView image, Bitmap bitmap) {
+        image.setPadding(0, 0, 0, 0);
+        image.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        image.setImageBitmap(bitmap);
+    }
+
+    private void resumeProgram(WatchNext.Program program) {
+        try {
+            Intent intent = Intent.parseUri(program.intentUri, Intent.URI_INTENT_SCHEME);
+            intent.setSelector(null);
+            if (intent.getComponent() != null
+                    && !program.packageName.equals(intent.getComponent().getPackageName())) {
+                intent.setComponent(null);
+            }
+            intent.setPackage(program.packageName);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            start(intent);
+        } catch (java.net.URISyntaxException e) {
+            Toast.makeText(this, "Resume link is not available", Toast.LENGTH_SHORT).show();
+        }
     }
 
     private View buildHeader() {
@@ -339,21 +540,13 @@ public class MainActivity extends Activity {
         LinearLayout t = new LinearLayout(this);
         t.setOrientation(LinearLayout.VERTICAL);
         ImageView art = new ImageView(this);
-        if (dock && a.mono != null) {
-            // Dock: white glyph straight on the band, no card.
-            art.setImageDrawable(a.mono);
-            art.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        } else {
-            art.setBackground(rounded(0xFF26262A, tileH * 0.08f));
-            art.setClipToOutline(true);
-            art.setImageDrawable(a.art);
-            if (a.banner) {
-                art.setScaleType(ImageView.ScaleType.CENTER_CROP);
-            } else {
-                art.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                int p = tileH / 5;
-                art.setPadding(p, p, p, p);
-            }
+        // Icons return to this white drawable when focus leaves them.
+        art.setTag(a.mono);
+        art.setImageDrawable(a.mono != null ? a.mono : a.icon);
+        art.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        if (!dock) {
+            int p = tileH / 10;
+            art.setPadding(p, p, p, p);
         }
         art.setContentDescription(a.label);
         t.addView(art, new LinearLayout.LayoutParams(tileW, tileH));
@@ -362,7 +555,8 @@ public class MainActivity extends Activity {
         label.setGravity(Gravity.CENTER);
         label.setSingleLine(true);
         label.setEllipsize(TextUtils.TruncateAt.END);
-        label.setAlpha(0f);
+        label.setTag(dock);
+        label.setAlpha(dock ? 0f : 1f);
         LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(tileW, labelH);
         llp.topMargin = G / 3;
         t.addView(label, llp);
@@ -390,7 +584,6 @@ public class MainActivity extends Activity {
         PackageManager pm = getPackageManager();
         Map<String, App> byPkg = new LinkedHashMap<>();
         List<String> hidden = Arrays.asList(getResources().getStringArray(R.array.hidden_apps));
-        List<String> dockPkgs = Arrays.asList(getResources().getStringArray(R.array.dock_apps));
         for (String cat : new String[]{Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER}) {
             for (ResolveInfo ri : pm.queryIntentActivities(new Intent(Intent.ACTION_MAIN).addCategory(cat), 0)) {
                 String pkg = ri.activityInfo.packageName;
@@ -401,11 +594,12 @@ public class MainActivity extends Activity {
                 a.launch = new Intent(Intent.ACTION_MAIN).addCategory(cat)
                         .setClassName(pkg, ri.activityInfo.name)
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+                a.icon = ri.loadIcon(pm);
                 a.art = ri.activityInfo.loadBanner(pm);
                 a.banner = a.art != null;
-                if (!a.banner) a.art = ri.loadIcon(pm);
+                if (!a.banner) a.art = a.icon;
                 a.glow = sampleGlow(a.art);
-                if (dockPkgs.contains(pkg)) a.mono = monochrome(ri.loadIcon(pm));
+                a.mono = monochrome(a.icon);
                 byPkg.put(pkg, a);
             }
         }
@@ -418,7 +612,7 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * White glyph for the dock. Uses the app's own monochrome layer (Android 13+) when it ships one.
+     * White glyph for unselected apps. Uses the app's own monochrome layer (Android 13+) when it ships one.
      * Otherwise the icon (adaptive: its foreground layer) is turned into a white mask:
      * - opaque corners (a square icon with its own background): keep what differs from that background;
      * - transparent corners: keep the shape, and cut white details out of a coloured glyph.
@@ -524,7 +718,8 @@ public class MainActivity extends Activity {
     private int rowSize(int r) {
         if (r < 0) return pills.size();
         if (r == 0) return dockApps.size();
-        return Math.max(0, Math.min(cols, gridApps.size() - (r - 1) * cols));
+        if (r == 1 && !continuePrograms.isEmpty()) return continuePrograms.size();
+        return Math.max(0, Math.min(cols, gridApps.size() - (r - firstGridRow()) * cols));
     }
 
     @Override
@@ -599,8 +794,10 @@ public class MainActivity extends Activity {
             else start(new Intent(Settings.ACTION_SETTINGS));
         } else if (row == 0) {
             launch(dockApps.get(col));
+        } else if (isContinueRow()) {
+            resumeProgram(continuePrograms.get(col));
         } else {
-            launch(gridApps.get((row - 1) * cols + col));
+            launch(gridApps.get((row - firstGridRow()) * cols + col));
         }
     }
 
@@ -612,13 +809,17 @@ public class MainActivity extends Activity {
 
         int dur = animate ? 180 : 0;
         if (focusedArt != null) {
+            if (focusedArt.getTag() instanceof Drawable) {
+                ((ImageView) focusedArt).setImageDrawable((Drawable) focusedArt.getTag());
+            }
             focusedArt.animate().scaleX(1f).scaleY(1f).setDuration(dur);
-            focusedLabel.animate().alpha(0f).setDuration(dur);
+            focusedLabel.animate().alpha(Boolean.TRUE.equals(focusedLabel.getTag()) ? 0f : 1f).setDuration(dur);
             focusedArt = focusedLabel = null;
         }
 
-        // Grid rows scroll so the focused row sits mid-screen; dock and top bar keep the page at rest.
-        pageTarget = row <= 0 ? 0 : Math.min(0, -(gridTop + (row - 1) * rowH - (H - tileTotalH) / 2f));
+        // Grid rows scroll so the focused row sits mid-screen; dock, Continue Watching and top bar keep the page at rest.
+        pageTarget = row < firstGridRow() ? 0
+                : Math.min(0, -(gridTop + (row - firstGridRow()) * rowH - (H - tileTotalH) / 2f));
         page.animate().translationY(pageTarget).setDuration(animate ? 320 : 0)
                 .setInterpolator(new DecelerateInterpolator(1.6f));
 
@@ -629,9 +830,14 @@ public class MainActivity extends Activity {
             r.inset(-pad, -pad);
             glass.moveTo(r, pillH / 2f + pad, animate);
         } else {
-            LinearLayout t = (row == 0 ? dockTiles : gridTiles).get(row == 0 ? col : (row - 1) * cols + col);
+            LinearLayout t = row == 0 ? dockTiles.get(col) : isContinueRow() ? continueTiles.get(col)
+                    : gridTiles.get((row - firstGridRow()) * cols + col);
             focusedArt = t.getChildAt(0);
             focusedLabel = t.getChildAt(1);
+            if (!isContinueRow()) {
+                App a = row == 0 ? dockApps.get(col) : gridApps.get((row - firstGridRow()) * cols + col);
+                ((ImageView) focusedArt).setImageDrawable(a.icon);
+            }
             focusedArt.animate().scaleX(SCALE).scaleY(SCALE).setDuration(dur);
             focusedLabel.animate().alpha(1f).setDuration(dur);
             float pad = G / 5f;
